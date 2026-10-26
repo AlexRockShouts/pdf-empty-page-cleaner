@@ -1,0 +1,21 @@
+[package]
+name = "pdf-cleaner"
+version = "1.0.0"
+edition = "2021"
+description = "Desktop app that removes empty pages (no text, no images) from PDF files"
+license = "MIT"
+
+[dependencies]
+eframe = { version = "0.29", default-features = false, features = ["glow", "default_fonts", "x11"] }
+lopdf = "0.34"
+rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "async-std"] }
+
+[profile.release]
+opt-level = 2
+lto = "thin"
+strip = true
+codegen-units = 1
+
+[[bin]]
+name = "pdf-cleaner"
+path = "src/main.rs"

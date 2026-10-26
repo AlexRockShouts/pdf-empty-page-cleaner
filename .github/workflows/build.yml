@@ -1,0 +1,60 @@
+name: Build
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows
+            os: windows-latest
+            command: pwsh scripts/build-windows.ps1
+            artifact_name: PDFCleaner-windows-x64
+            artifact_path: dist/PDFCleaner-windows-x64.exe
+          - name: macos
+            os: macos-latest
+            command: bash scripts/build-macos.sh
+            artifact_name: PDFCleaner-macos-universal
+            artifact_path: dist/PDFCleaner-macos-universal.zip
+          - name: linux
+            os: ubuntu-latest
+            command: bash scripts/build-linux.sh
+            artifact_name: PDFCleaner-linux-x64
+            artifact_path: dist/PDFCleaner-linux-x64.tar.gz
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: ${{ matrix.command }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ${{ matrix.artifact_path }}
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
