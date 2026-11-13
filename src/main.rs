@@ -25,6 +25,7 @@ fn run_cli(args: &[String]) {
                 return;
             }
             "--remove-graphics" => options.remove_graphics_only_pages = true,
+            "--keep-blank-scans" => options.analyze_scanned_pages = false,
             other if other.starts_with('-') => {
                 eprintln!("Unknown option: {other}\n");
                 print_help();
@@ -93,8 +94,10 @@ fn print_help() {
          \n\
          Options:\n\
          \x20 --remove-graphics    also remove pages that only contain vector graphics\n\
+         \x20 --keep-blank-scans   keep scanned pages even when the scan is blank\n\
          \x20 -h, --help           show this help\n\
          \n\
+         By default, scanned pages are analysed and blank scans are removed.\n\
          Cleaned files are written next to the originals as <name>-cleaned.pdf."
     );
 }

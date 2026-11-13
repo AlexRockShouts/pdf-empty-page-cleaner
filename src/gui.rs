@@ -37,6 +37,7 @@ struct CleanerApp {
     receiver: Option<Receiver<WorkerMsg>>,
     pending: Vec<PathBuf>,
     remove_graphics_only: bool,
+    analyze_scanned_pages: bool,
     last_output_dir: Option<PathBuf>,
 }
 
@@ -71,6 +72,7 @@ impl CleanerApp {
             receiver: None,
             pending: Vec::new(),
             remove_graphics_only: false,
+            analyze_scanned_pages: true,
             last_output_dir: None,
         }
     }
@@ -134,6 +136,7 @@ impl CleanerApp {
 
         let options = CleanOptions {
             remove_graphics_only_pages: self.remove_graphics_only,
+            analyze_scanned_pages: self.analyze_scanned_pages,
         };
         let ctx = ctx.clone();
 
@@ -254,7 +257,7 @@ impl CleanerApp {
         painter.text(
             rect.center() + egui::vec2(0.0, 46.0),
             egui::Align2::CENTER_CENTER,
-            "Empty = no text and no images",
+            "Empty = no visible content",
             egui::FontId::proportional(12.0),
             egui::Color32::from_rgb(100, 116, 139),
         );
@@ -407,7 +410,8 @@ impl eframe::App for CleanerApp {
                 );
                 ui.label(
                     egui::RichText::new(
-                        "Removes pages that have no text and no images. Nothing is uploaded.",
+                        "Removes pages with no visible content, including blank scans. \
+                         Nothing is uploaded.",
                     )
                     .size(13.0)
                     .color(MUTED),
@@ -440,6 +444,15 @@ impl eframe::App for CleanerApp {
                 });
 
                 ui.add_space(2.0);
+                ui.checkbox(
+                    &mut self.analyze_scanned_pages,
+                    "Remove blank scanned pages (analyses page images)",
+                )
+                .on_hover_text(
+                    "Decodes the images on scanned pages. A scan with no visible ink, or only a \
+                     thin strip of scanner ink at the edge, is treated as empty. Unsupported \
+                     image formats are always kept.",
+                );
                 ui.checkbox(
                     &mut self.remove_graphics_only,
                     "Also remove pages that contain only vector graphics",

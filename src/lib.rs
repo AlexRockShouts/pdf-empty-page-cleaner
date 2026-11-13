@@ -1,21 +1,50 @@
 //! Core logic for removing empty pages from PDF files.
 //!
 //! A page is considered empty when it does not draw any visible text and does
-//! not draw any image. Vector graphics are treated as content by default, but
-//! can optionally be ignored.
+//! not draw any meaningful image. Vector graphics are treated as content by
+//! default, but can optionally be ignored.
+//!
+//! Scanned pages are images, so "no text and no image" would keep every blank
+//! scan. To handle those, the images actually drawn on a page can be decoded
+//! and checked for visible ink. An image that is almost entirely uniform paper
+//! background counts as blank.
 
 use lopdf::{Dictionary, Document, Object, ObjectId, Stream};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 const MAX_FORM_DEPTH: usize = 16;
 const MAX_WARNINGS: usize = 12;
 
-#[derive(Debug, Clone, Copy, Default)]
+/// Longest side used when analysing a page image.
+const ANALYSIS_MAX_SIDE: u32 = 1200;
+/// Border ignored while looking for ink, as a fraction of the shorter side.
+const ANALYSIS_MARGIN: f32 = 0.02;
+/// Ink coverage (fraction of non-border pixels) below which an image is blank.
+const ANALYSIS_INK_THRESHOLD: f64 = 0.0005;
+/// Pages with less ink than this may still be blank if the ink only forms a
+/// narrow strip at the page edge (a typical scanner/show-through artifact).
+const ANALYSIS_STRIP_INK: f64 = 0.005;
+/// Resolution of the coarse grid used to locate ink on a page.
+const ANALYSIS_GRID: usize = 64;
+
+#[derive(Debug, Clone, Copy)]
 pub struct CleanOptions {
     /// Also remove pages whose only content is vector graphics (lines, shapes).
     pub remove_graphics_only_pages: bool,
+    /// Decode images drawn on a page and treat a blank scan as empty.
+    pub analyze_scanned_pages: bool,
+}
+
+impl Default for CleanOptions {
+    fn default() -> Self {
+        Self {
+            remove_graphics_only_pages: false,
+            analyze_scanned_pages: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -99,9 +128,17 @@ pub fn clean_pdf(source: &Path, options: CleanOptions) -> CleanReport {
 
     let mut removed_pages: Vec<u32> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
+    let mut image_cache: HashMap<ObjectId, ImageContent> = HashMap::new();
 
     for (number, page_id) in &pages {
-        let flags = page_flags(&doc, *page_id, *number, &mut warnings);
+        let flags = page_flags(
+            &doc,
+            *page_id,
+            *number,
+            options,
+            &mut image_cache,
+            &mut warnings,
+        );
         let empty =
             !flags.text && !flags.image && (!flags.drawing || options.remove_graphics_only_pages);
         if empty {
@@ -190,13 +227,30 @@ impl ContentFlags {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImageContent {
+    /// The image contains visible ink (or an unsupported encoding that we do
+    /// not want to risk removing). Either way the page must be kept.
+    Content,
+    /// The image is effectively blank paper.
+    Blank,
+    /// The image could not be decoded or is not safe to judge.
+    Unknown,
+}
+
 fn page_flags(
     doc: &Document,
     page_id: ObjectId,
     page_number: u32,
+    options: CleanOptions,
+    image_cache: &mut HashMap<ObjectId, ImageContent>,
     warnings: &mut Vec<String>,
 ) -> ContentFlags {
-    let scanner = Scanner { doc };
+    let mut scanner = Scanner {
+        doc,
+        options,
+        image_cache,
+    };
     let mut flags = ContentFlags::default();
     let resources = effective_resources(doc, page_id);
     let mut form_path = HashSet::new();
@@ -249,11 +303,13 @@ fn push_warning(warnings: &mut Vec<String>, message: String) {
 
 struct Scanner<'a> {
     doc: &'a Document,
+    options: CleanOptions,
+    image_cache: &'a mut HashMap<ObjectId, ImageContent>,
 }
 
 impl<'a> Scanner<'a> {
     fn scan_stream(
-        &self,
+        &mut self,
         data: &[u8],
         resources: Option<&'a Dictionary>,
         flags: &mut ContentFlags,
@@ -366,7 +422,7 @@ impl<'a> Scanner<'a> {
     }
 
     fn invoke_xobject(
-        &self,
+        &mut self,
         name: &[u8],
         resources: Option<&'a Dictionary>,
         flags: &mut ContentFlags,
@@ -411,7 +467,26 @@ impl<'a> Scanner<'a> {
             .and_then(Object::as_name)
             .unwrap_or(b"");
         match subtype {
-            b"Image" => flags.image = true,
+            b"Image" => {
+                if !self.options.analyze_scanned_pages {
+                    flags.image = true;
+                    return;
+                }
+                let verdict = match object_id {
+                    Some(id) => match self.image_cache.get(&id) {
+                        Some(verdict) => *verdict,
+                        None => {
+                            let verdict = analyze_image(self.doc, stream);
+                            self.image_cache.insert(id, verdict);
+                            verdict
+                        }
+                    },
+                    None => analyze_image(self.doc, stream),
+                };
+                if verdict != ImageContent::Blank {
+                    flags.image = true;
+                }
+            }
             b"Form" => {
                 let form_resources = stream
                     .dict
@@ -441,7 +516,7 @@ impl<'a> Scanner<'a> {
     }
 
     fn scan_annotations(
-        &self,
+        &mut self,
         page_id: ObjectId,
         resources: Option<&'a Dictionary>,
         flags: &mut ContentFlags,
@@ -504,7 +579,7 @@ impl<'a> Scanner<'a> {
     }
 
     fn scan_appearance(
-        &self,
+        &mut self,
         stream: &'a Stream,
         inherited_resources: Option<&'a Dictionary>,
         flags: &mut ContentFlags,
@@ -530,6 +605,452 @@ impl<'a> Scanner<'a> {
             }
         }
     }
+}
+
+/// Decide whether an image XObject contains visible ink.
+///
+/// Only common scan encodings are decoded (JPEG and raw/Flate RGB, gray and
+/// CMYK). Anything else is reported as unknown so the page is kept.
+fn analyze_image(doc: &Document, stream: &Stream) -> ImageContent {
+    if dict_bool(doc, &stream.dict, b"ImageMask").unwrap_or(false) {
+        // Stencil masks are small decorations; do not risk removing the page.
+        return ImageContent::Unknown;
+    }
+
+    let filters = if stream.dict.get(b"Filter").is_err() {
+        Vec::new()
+    } else {
+        match stream.filters() {
+            Ok(filters) => filters,
+            Err(_) => return ImageContent::Unknown,
+        }
+    };
+
+    if filters.len() == 1 && filters[0] == "DCTDecode" {
+        let decoded = match decode_array(doc, &stream.dict) {
+            Some(decoded) => decoded,
+            None => return ImageContent::Unknown,
+        };
+        if let Some(pairs) = &decoded {
+            if !pairs.iter().all(|&(low, high)| low == 0.0 && high == 1.0) {
+                return ImageContent::Unknown;
+            }
+        }
+        return match image::load_from_memory_with_format(&stream.content, image::ImageFormat::Jpeg)
+        {
+            Ok(image) => classify_image(&image.to_luma8()),
+            Err(_) => ImageContent::Unknown,
+        };
+    }
+
+    let Some(width) = dict_int(doc, &stream.dict, b"Width") else {
+        return ImageContent::Unknown;
+    };
+    let Some(height) = dict_int(doc, &stream.dict, b"Height") else {
+        return ImageContent::Unknown;
+    };
+    if !(1..=20000).contains(&width) || !(1..=20000).contains(&height) {
+        return ImageContent::Unknown;
+    }
+    let pixel_count = width as u64 * height as u64;
+    if pixel_count > 50_000_000 {
+        return ImageContent::Unknown;
+    }
+
+    let bpc = dict_int(doc, &stream.dict, b"BitsPerComponent").unwrap_or(8);
+    if !matches!(bpc, 1 | 2 | 4 | 8) {
+        return ImageContent::Unknown;
+    }
+
+    let Some(color_space) = stream
+        .dict
+        .get(b"ColorSpace")
+        .ok()
+        .and_then(|object| resolve_color_space(doc, object))
+    else {
+        return ImageContent::Unknown;
+    };
+
+    if let Ok(params) = stream.dict.get(b"DecodeParms") {
+        match deref(doc, params) {
+            Some(Object::Dictionary(params)) => {
+                if dict_int(doc, params, b"Predictor").unwrap_or(1) > 1 {
+                    return ImageContent::Unknown;
+                }
+            }
+            Some(Object::Null) | None => {}
+            _ => return ImageContent::Unknown,
+        }
+    }
+
+    let raw = match filters.as_slice() {
+        [] => stream.content.clone(),
+        [filter] if filter == "FlateDecode" => match inflate_zlib(&stream.content) {
+            Some(data) => data,
+            None => return ImageContent::Unknown,
+        },
+        _ => return ImageContent::Unknown,
+    };
+
+    let components = color_space.components();
+    let row_bytes = (width as usize * components * bpc as usize).div_ceil(8);
+    if raw.len() < row_bytes.saturating_mul(height as usize) {
+        return ImageContent::Unknown;
+    }
+
+    let decoded = match decode_array(doc, &stream.dict) {
+        Some(decoded) => decoded,
+        None => return ImageContent::Unknown,
+    };
+    let decode_pairs = match &decoded {
+        None => None,
+        Some(pairs) => {
+            if matches!(&color_space, ColorSpace::Indexed { .. }) || pairs.len() != components {
+                return ImageContent::Unknown;
+            }
+            Some(pairs.as_slice())
+        }
+    };
+
+    let max_value = (1u32 << bpc) - 1;
+    let mask = max_value as u8;
+    let mut gray = vec![0u8; pixel_count as usize];
+
+    for y in 0..height as usize {
+        let row_start = y * row_bytes;
+        for x in 0..width as usize {
+            let mut samples = [0u32; 4];
+            for (component, sample) in samples.iter_mut().enumerate().take(components) {
+                let sample_index = x * components + component;
+                let bit = sample_index * bpc as usize;
+                let byte = raw[row_start + bit / 8];
+                let shift = 8 - bpc as usize - (bit % 8);
+                *sample = ((byte >> shift) & mask) as u32;
+            }
+
+            let luma = match &color_space {
+                ColorSpace::Gray => scale_components(&samples, max_value, 1, decode_pairs)[0],
+                ColorSpace::Rgb => rgb_luma(scale_components(&samples, max_value, 3, decode_pairs)),
+                ColorSpace::Cmyk => {
+                    cmyk_luma(scale_components(&samples, max_value, 4, decode_pairs))
+                }
+                ColorSpace::Indexed { base, lookup, high } => {
+                    let index = samples[0] as usize;
+                    if index > *high {
+                        return ImageContent::Unknown;
+                    }
+                    let base_components = base.components();
+                    let offset = index * base_components;
+                    let end = offset + base_components;
+                    if end > lookup.len() {
+                        return ImageContent::Unknown;
+                    }
+                    indexed_luma(base, &lookup[offset..end]).unwrap_or(255)
+                }
+            };
+
+            gray[y * width as usize + x] = luma;
+        }
+    }
+
+    match image::GrayImage::from_raw(width as u32, height as u32, gray) {
+        Some(image) => classify_image(&image),
+        None => ImageContent::Unknown,
+    }
+}
+
+/// Decide whether an already decoded grayscale image is blank.
+fn classify_image(image: &image::GrayImage) -> ImageContent {
+    let (width, height) = image.dimensions();
+    if width == 0 || height == 0 {
+        return ImageContent::Unknown;
+    }
+
+    let longest = width.max(height);
+    let scaled;
+    let image = if longest > ANALYSIS_MAX_SIDE {
+        let scale = ANALYSIS_MAX_SIDE as f32 / longest as f32;
+        let target_width = ((width as f32 * scale).round() as u32).max(1);
+        let target_height = ((height as f32 * scale).round() as u32).max(1);
+        scaled = image::imageops::thumbnail(image, target_width, target_height);
+        &scaled
+    } else {
+        image
+    };
+
+    let (width, height) = image.dimensions();
+    let margin = ((width.min(height) as f32) * ANALYSIS_MARGIN).round() as u32;
+    let margin = margin
+        .min(width.saturating_sub(1) / 2)
+        .min(height.saturating_sub(1) / 2);
+    let x_start = margin;
+    let x_end = width.saturating_sub(margin);
+    let y_start = margin;
+    let y_end = height.saturating_sub(margin);
+    if x_start >= x_end || y_start >= y_end {
+        return ImageContent::Unknown;
+    }
+
+    let mut histogram = [0u64; 256];
+    for y in y_start..y_end {
+        for x in x_start..x_end {
+            histogram[image.get_pixel(x, y)[0] as usize] += 1;
+        }
+    }
+    let total: u64 = histogram.iter().sum();
+    if total == 0 {
+        return ImageContent::Unknown;
+    }
+
+    let mut cumulative = 0u64;
+    let mut background = 255u8;
+    for (value, count) in histogram.iter().enumerate() {
+        cumulative += count;
+        if cumulative * 10 >= total * 9 {
+            background = value as u8;
+            break;
+        }
+    }
+
+    // A very dark "background" means this is not a normal paper scan; do not
+    // guess, keep the page.
+    if background < 128 {
+        return ImageContent::Unknown;
+    }
+
+    let cut = ((background as u32 * 3) / 4).min(150) as usize;
+    let ink: u64 = histogram[..cut].iter().sum();
+    let ink_fraction = ink as f64 / total as f64;
+    if ink_fraction < ANALYSIS_INK_THRESHOLD {
+        return ImageContent::Blank;
+    }
+
+    // A little ink is normal on an otherwise blank scan: bleed-through or the
+    // footer of the facing page often shows up as one narrow strip at an edge.
+    if ink_fraction < ANALYSIS_STRIP_INK
+        && is_edge_strip(image, x_start, x_end, y_start, y_end, cut as u8)
+    {
+        return ImageContent::Blank;
+    }
+
+    ImageContent::Content
+}
+
+/// Returns true when the ink forms a narrow band that spans most of the page
+/// and sits against one of its edges.
+fn is_edge_strip(
+    image: &image::GrayImage,
+    x_start: u32,
+    x_end: u32,
+    y_start: u32,
+    y_end: u32,
+    cut: u8,
+) -> bool {
+    let crop_width = (x_end - x_start) as usize;
+    let crop_height = (y_end - y_start) as usize;
+    if crop_width == 0 || crop_height == 0 {
+        return false;
+    }
+
+    let mut cells = [[0u16; ANALYSIS_GRID]; ANALYSIS_GRID];
+    for y in y_start..y_end {
+        let grid_y = ((y - y_start) as usize * ANALYSIS_GRID / crop_height).min(ANALYSIS_GRID - 1);
+        for x in x_start..x_end {
+            if image.get_pixel(x, y)[0] < cut {
+                let grid_x =
+                    ((x - x_start) as usize * ANALYSIS_GRID / crop_width).min(ANALYSIS_GRID - 1);
+                cells[grid_y][grid_x] = cells[grid_y][grid_x].saturating_add(1);
+            }
+        }
+    }
+
+    let (mut left, mut right, mut top, mut bottom) = (ANALYSIS_GRID, 0usize, ANALYSIS_GRID, 0usize);
+    for (grid_y, row) in cells.iter().enumerate() {
+        for (grid_x, &count) in row.iter().enumerate() {
+            if count >= 2 {
+                left = left.min(grid_x);
+                right = right.max(grid_x);
+                top = top.min(grid_y);
+                bottom = bottom.max(grid_y);
+            }
+        }
+    }
+    if left > right || top > bottom {
+        // Only isolated dust: still blank.
+        return true;
+    }
+
+    let width = (right - left + 1) as f32 / ANALYSIS_GRID as f32;
+    let height = (bottom - top + 1) as f32 / ANALYSIS_GRID as f32;
+    let near_left = left as f32 / ANALYSIS_GRID as f32 <= 0.25;
+    let near_right = (right + 1) as f32 / ANALYSIS_GRID as f32 >= 0.75;
+    let near_top = top as f32 / ANALYSIS_GRID as f32 <= 0.25;
+    let near_bottom = (bottom + 1) as f32 / ANALYSIS_GRID as f32 >= 0.75;
+
+    let vertical_strip = width <= 0.15 && height >= 0.5 && (near_left || near_right);
+    let horizontal_strip = height <= 0.15 && width >= 0.5 && (near_top || near_bottom);
+    vertical_strip || horizontal_strip
+}
+
+#[derive(Debug, Clone)]
+enum ColorSpace {
+    Gray,
+    Rgb,
+    Cmyk,
+    Indexed {
+        base: Box<ColorSpace>,
+        lookup: Vec<u8>,
+        high: usize,
+    },
+}
+
+impl ColorSpace {
+    fn components(&self) -> usize {
+        match self {
+            ColorSpace::Gray => 1,
+            ColorSpace::Rgb => 3,
+            ColorSpace::Cmyk => 4,
+            ColorSpace::Indexed { .. } => 1,
+        }
+    }
+}
+
+fn resolve_color_space(doc: &Document, object: &Object) -> Option<ColorSpace> {
+    match deref(doc, object)? {
+        Object::Name(name) => match name.as_slice() {
+            b"DeviceGray" | b"G" | b"CalGray" => Some(ColorSpace::Gray),
+            b"DeviceRGB" | b"RGB" | b"CalRGB" => Some(ColorSpace::Rgb),
+            b"DeviceCMYK" | b"CMYK" => Some(ColorSpace::Cmyk),
+            _ => None,
+        },
+        Object::Array(items) => {
+            let family = deref(doc, items.first()?)?.as_name().ok()?;
+            match family {
+                b"Indexed" | b"I" => {
+                    let base = resolve_color_space(doc, items.get(1)?)?;
+                    if matches!(&base, ColorSpace::Indexed { .. }) {
+                        return None;
+                    }
+                    let high = deref(doc, items.get(2)?)?.as_i64().ok()?;
+                    if high < 0 {
+                        return None;
+                    }
+                    let lookup_object = deref(doc, items.get(3)?)?;
+                    let lookup = match lookup_object {
+                        Object::String(bytes, _) => bytes.clone(),
+                        Object::Stream(stream) => stream.get_plain_content().ok()?,
+                        _ => return None,
+                    };
+                    Some(ColorSpace::Indexed {
+                        base: Box::new(base),
+                        lookup,
+                        high: high as usize,
+                    })
+                }
+                b"ICCBased" => {
+                    let stream = deref(doc, items.get(1)?)?.as_stream().ok()?;
+                    let components = stream
+                        .dict
+                        .get(b"N")
+                        .ok()
+                        .and_then(|object| deref(doc, object))
+                        .and_then(|object| object.as_i64().ok())?;
+                    match components {
+                        1 => Some(ColorSpace::Gray),
+                        3 => Some(ColorSpace::Rgb),
+                        4 => Some(ColorSpace::Cmyk),
+                        _ => None,
+                    }
+                }
+                b"CalGray" => Some(ColorSpace::Gray),
+                b"CalRGB" => Some(ColorSpace::Rgb),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Read the optional `/Decode` array. `Some(None)` means the key is absent,
+/// `None` means the array is malformed (caller keeps the page).
+fn decode_array(doc: &Document, dict: &Dictionary) -> Option<Option<Vec<(f32, f32)>>> {
+    let Ok(object) = dict.get(b"Decode") else {
+        return Some(None);
+    };
+    let Some(Object::Array(values)) = deref(doc, object) else {
+        return None;
+    };
+    if values.len() % 2 != 0 {
+        return None;
+    }
+
+    let mut pairs = Vec::with_capacity(values.len() / 2);
+    for pair in values.chunks(2) {
+        let low = deref(doc, &pair[0])?.as_float().ok()?;
+        let high = deref(doc, &pair[1])?.as_float().ok()?;
+        pairs.push((low, high));
+    }
+    Some(Some(pairs))
+}
+
+fn scale_components(
+    samples: &[u32; 4],
+    max_value: u32,
+    count: usize,
+    decode: Option<&[(f32, f32)]>,
+) -> [u8; 4] {
+    let mut result = [0u8; 4];
+    for index in 0..count {
+        let (low, high) = decode
+            .and_then(|pairs| pairs.get(index).copied())
+            .unwrap_or((0.0, 1.0));
+        let normalized = samples[index] as f32 / max_value as f32;
+        let mapped = low + normalized * (high - low);
+        result[index] = (mapped.clamp(0.0, 1.0) * 255.0).round() as u8;
+    }
+    result
+}
+
+fn rgb_luma([r, g, b, _]: [u8; 4]) -> u8 {
+    ((r as u32 * 299 + g as u32 * 587 + b as u32 * 114) / 1000) as u8
+}
+
+fn cmyk_luma([c, m, y, k]: [u8; 4]) -> u8 {
+    let r = ((255 - c as u32) * (255 - k as u32) / 255) as u8;
+    let g = ((255 - m as u32) * (255 - k as u32) / 255) as u8;
+    let b = ((255 - y as u32) * (255 - k as u32) / 255) as u8;
+    rgb_luma([r, g, b, 0])
+}
+
+fn indexed_luma(base: &ColorSpace, sample: &[u8]) -> Option<u8> {
+    match base {
+        ColorSpace::Gray => Some(sample[0]),
+        ColorSpace::Rgb => Some(rgb_luma([sample[0], sample[1], sample[2], 0])),
+        ColorSpace::Cmyk => Some(cmyk_luma([sample[0], sample[1], sample[2], sample[3]])),
+        ColorSpace::Indexed { .. } => None,
+    }
+}
+
+fn inflate_zlib(data: &[u8]) -> Option<Vec<u8>> {
+    let mut output = Vec::new();
+    flate2::read::ZlibDecoder::new(data)
+        .read_to_end(&mut output)
+        .ok()?;
+    Some(output)
+}
+
+fn dict_int(doc: &Document, dict: &Dictionary, key: &[u8]) -> Option<i64> {
+    dict.get(key)
+        .ok()
+        .and_then(|object| deref(doc, object))
+        .and_then(|object| object.as_i64().ok())
+}
+
+fn dict_bool(doc: &Document, dict: &Dictionary, key: &[u8]) -> Option<bool> {
+    dict.get(key)
+        .ok()
+        .and_then(|object| deref(doc, object))
+        .and_then(|object| object.as_bool().ok())
 }
 
 fn is_invisible_text_mode(mode: i32) -> bool {
@@ -699,9 +1220,71 @@ mod tests {
     }
 
     fn flags_for(doc: &Document, page: u32) -> ContentFlags {
+        flags_for_with(doc, page, CleanOptions::default())
+    }
+
+    fn flags_for_with(doc: &Document, page: u32, options: CleanOptions) -> ContentFlags {
         let id = doc.get_pages()[&page];
         let mut warnings = Vec::new();
-        page_flags(doc, id, page, &mut warnings)
+        let mut image_cache = HashMap::new();
+        page_flags(doc, id, page, options, &mut image_cache, &mut warnings)
+    }
+
+    fn gray_image(width: i64, height: i64, value: u8) -> Stream {
+        Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Image",
+                "Width" => width,
+                "Height" => height,
+                "ColorSpace" => "DeviceGray",
+                "BitsPerComponent" => 8,
+            },
+            vec![value; (width * height) as usize],
+        )
+    }
+
+    fn jpeg_image(width: u32, height: u32, value: u8) -> Stream {
+        let image = image::GrayImage::from_pixel(width, height, image::Luma([value]));
+        let mut data = Vec::new();
+        let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut data, 90);
+        encoder.encode_image(&image).unwrap();
+        Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Image",
+                "Width" => width,
+                "Height" => height,
+                "ColorSpace" => "DeviceGray",
+                "BitsPerComponent" => 8,
+                "Filter" => "DCTDecode",
+                "Decode" => vec![0.into(), 1.into()],
+            },
+            data,
+        )
+    }
+
+    fn flate_image(width: i64, height: i64, value: u8) -> Stream {
+        use std::io::Write;
+
+        let mut encoder =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder
+            .write_all(&vec![value; (width * height) as usize])
+            .unwrap();
+        let data = encoder.finish().unwrap();
+        Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Image",
+                "Width" => width,
+                "Height" => height,
+                "ColorSpace" => "DeviceGray",
+                "BitsPerComponent" => 8,
+                "Filter" => "FlateDecode",
+            },
+            data,
+        )
     }
 
     fn temp_dir(name: &str) -> PathBuf {
@@ -766,22 +1349,142 @@ mod tests {
 
     #[test]
     fn unused_image_resource_does_not_keep_page() {
-        let image = Stream::new(
-            dictionary! {
-                "Type" => "XObject",
-                "Subtype" => "Image",
-                "Width" => 1,
-                "Height" => 1,
-                "ColorSpace" => "DeviceGray",
-                "BitsPerComponent" => 8,
-            },
-            vec![0u8],
-        );
+        let image = gray_image(1, 1, 0);
         let doc = document_with_pages_with_image(Vec::new(), image);
         let flags = flags_for(&doc, 1);
         assert!(!flags.text);
         assert!(!flags.image);
         assert!(!flags.drawing);
+    }
+
+    fn gray_pixels_image(width: i64, height: i64, pixels: Vec<u8>) -> Stream {
+        Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Image",
+                "Width" => width,
+                "Height" => height,
+                "ColorSpace" => "DeviceGray",
+                "BitsPerComponent" => 8,
+            },
+            pixels,
+        )
+    }
+
+    fn image_with_band(band_x: i64, band_y: i64, band_width: i64, band_height: i64) -> Stream {
+        let size = 400i64;
+        let mut pixels = vec![255u8; (size * size) as usize];
+        for y in band_y..(band_y + band_height) {
+            for x in band_x..(band_x + band_width) {
+                pixels[(y * size + x) as usize] = 0;
+            }
+        }
+        gray_pixels_image(size, size, pixels)
+    }
+
+    #[test]
+    fn blank_white_scan_is_empty() {
+        let image = gray_image(200, 200, 255);
+        let doc = document_with_pages_with_image(b"q 200 0 0 200 0 0 cm /Im1 Do Q".to_vec(), image);
+        let flags = flags_for(&doc, 1);
+        assert!(!flags.text);
+        assert!(!flags.image);
+        assert!(!flags.drawing);
+    }
+
+    #[test]
+    fn edge_strip_is_blank() {
+        // Footer-like strip at the bottom edge: typical bleed-through.
+        let image = image_with_band(100, 370, 200, 3);
+        let doc = document_with_pages_with_image(b"q 400 0 0 400 0 0 cm /Im1 Do Q".to_vec(), image);
+        assert!(!flags_for(&doc, 1).image);
+    }
+
+    #[test]
+    fn vertical_edge_strip_is_blank() {
+        let image = image_with_band(360, 60, 2, 300);
+        let doc = document_with_pages_with_image(b"q 400 0 0 400 0 0 cm /Im1 Do Q".to_vec(), image);
+        assert!(!flags_for(&doc, 1).image);
+    }
+
+    #[test]
+    fn centered_strip_is_content() {
+        let image = image_with_band(100, 198, 200, 3);
+        let doc = document_with_pages_with_image(b"q 400 0 0 400 0 0 cm /Im1 Do Q".to_vec(), image);
+        assert!(flags_for(&doc, 1).image);
+    }
+
+    #[test]
+    fn dark_scan_is_content() {
+        let image = gray_image(200, 200, 0);
+        let doc = document_with_pages_with_image(b"q 200 0 0 200 0 0 cm /Im1 Do Q".to_vec(), image);
+        let flags = flags_for(&doc, 1);
+        assert!(flags.image);
+    }
+
+    #[test]
+    fn decode_array_is_applied() {
+        let mut image = gray_image(200, 200, 0);
+        image.dict.set("Decode", vec![1.into(), 0.into()]);
+        let doc = document_with_pages_with_image(b"q 200 0 0 200 0 0 cm /Im1 Do Q".to_vec(), image);
+        assert!(!flags_for(&doc, 1).image);
+    }
+
+    #[test]
+    fn blank_flate_scan_is_empty() {
+        let image = flate_image(200, 200, 255);
+        let doc = document_with_pages_with_image(b"q 200 0 0 200 0 0 cm /Im1 Do Q".to_vec(), image);
+        assert!(!flags_for(&doc, 1).image);
+    }
+
+    #[test]
+    fn blank_jpeg_scan_is_empty() {
+        let image = jpeg_image(320, 240, 255);
+        let doc = document_with_pages_with_image(b"q 320 0 0 240 0 0 cm /Im1 Do Q".to_vec(), image);
+        let flags = flags_for(&doc, 1);
+        assert!(!flags.image);
+    }
+
+    #[test]
+    fn jpeg_with_black_mark_is_content() {
+        let image = jpeg_image(320, 240, 0);
+        let doc = document_with_pages_with_image(b"q 320 0 0 240 0 0 cm /Im1 Do Q".to_vec(), image);
+        let flags = flags_for(&doc, 1);
+        assert!(flags.image);
+    }
+
+    #[test]
+    fn scan_analysis_can_be_disabled() {
+        let image = gray_image(200, 200, 255);
+        let doc = document_with_pages_with_image(b"q 200 0 0 200 0 0 cm /Im1 Do Q".to_vec(), image);
+        let options = CleanOptions {
+            analyze_scanned_pages: false,
+            ..CleanOptions::default()
+        };
+        assert!(flags_for_with(&doc, 1, options).image);
+    }
+
+    #[test]
+    fn blank_scan_pages_are_removed_end_to_end() {
+        let dir = temp_dir("scans");
+        let source = dir.join("scan.pdf");
+        let image = gray_image(200, 200, 255);
+        let mut doc = document_with_resources(
+            vec![
+                b"q 200 0 0 200 0 0 cm /Im1 Do Q".to_vec(),
+                b"BT /F1 12 Tf 72 720 Td (keep me) Tj ET".to_vec(),
+                b"q 200 0 0 200 0 0 cm /Im1 Do Q".to_vec(),
+            ],
+            Some((b"Im1".to_vec(), image)),
+        );
+        doc.save(&source).unwrap();
+
+        let report = clean_pdf(&source, CleanOptions::default());
+        assert!(report.error.is_none(), "{:?}", report.error);
+        assert_eq!(report.removed_pages, vec![1, 3]);
+        let cleaned = Document::load(dir.join("scan-cleaned.pdf")).unwrap();
+        assert_eq!(cleaned.get_pages().len(), 1);
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -915,6 +1618,7 @@ mod tests {
             &source,
             CleanOptions {
                 remove_graphics_only_pages: true,
+                ..CleanOptions::default()
             },
         );
         assert!(report.error.is_none());

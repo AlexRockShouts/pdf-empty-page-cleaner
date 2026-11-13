@@ -1,9 +1,10 @@
 # PDF Empty Page Cleaner
 
-A small offline desktop app for **Windows, macOS and Linux** that removes empty pages from PDF files.
+A small offline desktop app for **Windows, macOS and Linux** that removes empty pages from PDF files, including **blank scanned pages**.
 
 - Drag & drop one or many PDF files (or click to choose files).
-- A page is treated as **empty when it draws no text and no images**.
+- A page is treated as **empty when it draws no visible content**: no text, no meaningful image and no vector graphics.
+- Scanned pages are analysed too: if the scan contains no visible ink, the page is removed.
 - The cleaned file is saved next to the original as `<name>-cleaned.pdf`.
 - Everything runs locally. Nothing is uploaded anywhere.
 - Single executable. No Python, no installer, no runtime to install.
@@ -26,6 +27,7 @@ Grab the file for your system from the [latest release](../../releases/latest):
 
 Options:
 
+- **Remove blank scanned pages (analyses page images)** - enabled by default. The images drawn on each page are decoded and checked for visible ink. Disable this to keep every scanned page.
 - **Also remove pages that contain only vector graphics** - by default, a page that draws lines/shapes is kept. Enable this to treat those pages as empty too.
 - Pages that are entirely blank are always removed, including pages with no content stream at all.
 - If every page in a file is empty, the app refuses to write an empty PDF and reports it instead.
@@ -36,12 +38,16 @@ The scan looks at the actual page content, including content streams, recursivel
 
 - Visible text via `Tj`, `TJ`, `'` and `"` counts as content.
 - Invisible text (render mode 3 or 7, sometimes used for OCR layers) does not count.
-- Images, including images inside nested forms, count as content.
+- Images count as content when they contain visible ink. A decoded image is treated as blank when less than 0.05% of its non-border pixels are significantly darker than the estimated paper background.
+- A page with very little ink is also treated as blank when that ink only forms a narrow strip against one page edge - the typical footprint of scanner bleed-through or a footer from the facing page.
+- Inline images are always treated as content.
 - Vector drawing (fills, strokes, shadings) counts as content unless the option above is enabled.
 
-This means a **scanned blank page is kept**, because it is an image of a blank page. The app does not do OCR or image analysis; it uses the PDF structure.
+For scanned pages, this means a page that is a picture of blank paper is removed, while a page with text, handwriting, stamps or drawings is kept. The analysis is deliberately conservative:
 
-The original file is never modified. If `<name>-cleaned.pdf` already exists, it is replaced. Password-protected PDFs are skipped (a PDF with an empty user password is supported).
+- Only JPEG (`DCTDecode`) and raw or Flate-compressed gray, RGB, CMYK and Indexed images are decoded. Other encodings - notably CCITT G3/G4, JBIG2 and JPEG 2000, which are common for black-and-white scans - are **kept** rather than guessed at.
+- Faint bleed-through that spreads across a page may still count as ink and keep it. A page with clearly visible marks or drawings is kept.
+- The original file is never modified. If `<name>-cleaned.pdf` already exists, it is replaced. Password-protected PDFs are skipped (a PDF with an empty user password is supported).
 
 ## Command line (macOS and Linux)
 
@@ -50,6 +56,7 @@ The same binary also works without the GUI:
 ```bash
 ./pdf-cleaner file.pdf other.pdf          # clean one or more files
 ./pdf-cleaner --remove-graphics file.pdf  # also drop vector-only pages
+./pdf-cleaner --keep-blank-scans file.pdf # keep scanned pages even if blank
 ./pdf-cleaner --help
 ```
 

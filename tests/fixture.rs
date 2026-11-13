@@ -33,6 +33,7 @@ fn handles_a_hand_written_pdf() {
         &source,
         CleanOptions {
             remove_graphics_only_pages: true,
+            ..CleanOptions::default()
         },
     );
     assert!(graphics.error.is_none());
